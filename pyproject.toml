@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mainframe-migration-agents"
+version = "0.1.0"
+description = "Orquestrador multi-agente para migração de sistemas COBOL/Mainframe para Azure"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Mainframe Migration Team"}
+]
+keywords = ["ai-agents", "mainframe-migration", "langgraph", "azure", "anthropic", "cobol"]
+
+[project.scripts]
+migrate = "examples.run_migration:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "--tb=short -v --cov=. --cov-report=term-missing"
+asyncio_mode = "auto"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+strict = false
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = ["E501"]
+
+[tool.coverage.run]
+omit = ["tests/*", ".venv/*", "examples/*"]
