@@ -1,0 +1,261 @@
+# Azure DevOps Pipeline - Mainframe Migration
+# Stages: Build → Docker → Dev → Parity Validation → Homolog → Prod (canário)
+
+trigger:
+  branches:
+    include:
+      - main
+      - feature/migrate-*
+
+variables:
+  - group: migration-secrets
+  - name: mavenCacheFolder
+    value: $(Pipeline.Workspace)/.m2/repository
+  - name: imageRepository
+    value: $(MODULE_NAME)
+  - name: containerRegistry
+    value: $(ACR_LOGIN_SERVER)
+  - name: dockerfilePath
+    value: Dockerfile
+  - name: tag
+    value: $(Build.BuildId)
+
+stages:
+  - stage: Build
+    displayName: Build e Quality Gate
+    jobs:
+      - job: MavenBuild
+        displayName: Maven Build + SonarQube
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: Cache@2
+            inputs:
+              key: 'maven | $(Agent.OS) | pom.xml'
+              restoreKeys: 'maven | $(Agent.OS)'
+              path: $(mavenCacheFolder)
+            displayName: Cache Maven
+
+          - task: Maven@4
+            inputs:
+              mavenPomFile: pom.xml
+              goals: clean verify sonar:sonar
+              options: >
+                -Dmaven.repo.local=$(mavenCacheFolder)
+                -Dsonar.projectKey=$(SONARQUBE_PROJECT_KEY)
+                -Dsonar.host.url=$(SONARQUBE_URL)
+                -Dsonar.login=$(SONARQUBE_TOKEN)
+                -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+              jdkVersionOption: '1.17'
+            displayName: Maven Build + SonarQube Analysis
+
+          - task: SonarQubePublish@5
+            inputs:
+              pollingTimeoutSec: '300'
+            displayName: Aguardar Quality Gate
+
+          - script: |
+              STATUS=$(curl -s -u $(SONARQUBE_TOKEN): \
+                "$(SONARQUBE_URL)/api/qualitygates/project_status?projectKey=$(SONARQUBE_PROJECT_KEY)" \
+                | jq -r '.projectStatus.status')
+              echo "Quality Gate Status: $STATUS"
+              if [ "$STATUS" != "OK" ]; then
+                echo "##[error]Quality Gate falhou! Status: $STATUS"
+                exit 1
+              fi
+            displayName: Verificar Quality Gate
+
+  - stage: Docker
+    displayName: Build e Push Docker Image
+    dependsOn: Build
+    jobs:
+      - job: DockerBuildPush
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: Docker@2
+            displayName: Login ACR
+            inputs:
+              command: login
+              containerRegistry: $(ACR_SERVICE_CONNECTION)
+
+          - task: Docker@2
+            displayName: Build Image
+            inputs:
+              command: build
+              repository: $(imageRepository)
+              dockerfile: $(dockerfilePath)
+              containerRegistry: $(ACR_SERVICE_CONNECTION)
+              tags: |
+                $(tag)
+                latest
+              arguments: --build-arg BUILD_SHA=$(Build.SourceVersion)
+
+          - task: Docker@2
+            displayName: Push Image
+            inputs:
+              command: push
+              repository: $(imageRepository)
+              containerRegistry: $(ACR_SERVICE_CONNECTION)
+              tags: |
+                $(tag)
+                latest
+
+          - script: |
+              echo "##vso[task.setvariable variable=IMAGE_TAG;isOutput=true]$(tag)"
+            name: setImageTag
+            displayName: Exportar IMAGE_TAG
+
+  - stage: Deploy_Dev
+    displayName: Deploy em Desenvolvimento
+    dependsOn: Docker
+    variables:
+      IMAGE_TAG: $[ stageDependencies.Docker.DockerBuildPush.outputs['setImageTag.IMAGE_TAG'] ]
+    jobs:
+      - deployment: DeployDev
+        environment: development
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: KubernetesManifest@1
+                  displayName: Deploy no AKS Dev
+                  inputs:
+                    action: deploy
+                    connectionType: azureResourceManager
+                    azureSubscriptionConnection: $(AZURE_SERVICE_CONNECTION)
+                    azureResourceGroup: $(AKS_RESOURCE_GROUP)
+                    kubernetesCluster: $(AKS_CLUSTER_NAME)
+                    namespace: migration-dev
+                    manifests: azure/deployment.yaml
+                    containers: $(ACR_LOGIN_SERVER)/$(MODULE_NAME):$(IMAGE_TAG)
+
+  - stage: Parity_Validation
+    displayName: Validação de Paridade
+    dependsOn: Deploy_Dev
+    jobs:
+      - job: RunParityTests
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.11'
+
+          - script: pip install -r requirements.txt
+            displayName: Instalar dependências Python
+
+          - script: |
+              python -c "
+from parity.runner import ParityRunner
+from parity.reporter import ParityReporter
+import json, sys
+
+runner = ParityRunner()
+reporter = ParityReporter()
+
+with open('parity_test_cases.json') as f:
+    test_cases = json.load(f)
+
+deltas = runner.run(module_name='$(MODULE_NAME)', test_inputs=test_cases)
+report = reporter.generate('$(MODULE_NAME)', '$(Build.BuildId)', deltas, len(test_cases))
+print(reporter.to_text(report))
+
+if report['status'] != 'APPROVED':
+    sys.exit(1)
+"
+            displayName: Executar Parity Tests
+            env:
+              MAINFRAME_SHADOW_ENDPOINT: $(MAINFRAME_SHADOW_ENDPOINT)
+              MAINFRAME_SHADOW_API_KEY: $(MAINFRAME_SHADOW_API_KEY)
+              JAVA_SERVICE_BASE_URL: http://$(MODULE_NAME)-svc.migration-dev.svc.cluster.local
+
+  - stage: Deploy_Homolog
+    displayName: Deploy em Homologação
+    dependsOn: Parity_Validation
+    jobs:
+      - deployment: DeployHomolog
+        environment: homologation
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: KubernetesManifest@1
+                  displayName: Deploy no AKS Homolog
+                  inputs:
+                    action: deploy
+                    connectionType: azureResourceManager
+                    azureSubscriptionConnection: $(AZURE_SERVICE_CONNECTION)
+                    azureResourceGroup: $(AKS_RESOURCE_GROUP)
+                    kubernetesCluster: $(AKS_CLUSTER_NAME)
+                    namespace: migration-homolog
+                    manifests: azure/deployment.yaml
+                    containers: $(ACR_LOGIN_SERVER)/$(MODULE_NAME):$(IMAGE_TAG)
+
+  - stage: Deploy_Prod
+    displayName: Deploy em Produção (Canário)
+    dependsOn: Deploy_Homolog
+    jobs:
+      - deployment: DeployProdCanary
+        environment: production
+        pool:
+          vmImage: ubuntu-latest
+        strategy:
+          canary:
+            increments: [10, 50, 100]
+            preDeploy:
+              steps:
+                - script: echo "Iniciando deploy canário - $(strategy.increment)%"
+            deploy:
+              steps:
+                - task: KubernetesManifest@1
+                  displayName: Deploy Canário $(strategy.increment)%
+                  inputs:
+                    action: deploy
+                    connectionType: azureResourceManager
+                    azureSubscriptionConnection: $(AZURE_SERVICE_CONNECTION)
+                    azureResourceGroup: $(AKS_RESOURCE_GROUP)
+                    kubernetesCluster: $(AKS_CLUSTER_NAME)
+                    namespace: migration
+                    strategy: canary
+                    percentage: $(strategy.increment)
+                    manifests: azure/deployment.yaml
+                    containers: $(ACR_LOGIN_SERVER)/$(MODULE_NAME):$(IMAGE_TAG)
+            postRouteTraffic:
+              steps:
+                - script: |
+                    echo "Monitorando error rate por 5 minutos..."
+                    sleep 300
+                    ERROR_RATE=$(az monitor metrics query \
+                      --resource $(AKS_RESOURCE_ID) \
+                      --metric 'requests/failed' \
+                      --query 'value[0].timeseries[0].data[-1].average' \
+                      -o tsv)
+                    echo "Error Rate: $ERROR_RATE"
+                    if (( $(echo "$ERROR_RATE > 1" | bc -l) )); then
+                      echo "##[error]Error rate acima de 1%! Rollback automático iniciado."
+                      exit 1
+                    fi
+                  displayName: Verificar Error Rate
+            on:
+              failure:
+                steps:
+                  - task: KubernetesManifest@1
+                    displayName: Rollback Automático
+                    inputs:
+                      action: reject
+                      strategy: canary
+                      manifests: azure/deployment.yaml
+              success:
+                steps:
+                  - task: KubernetesManifest@1
+                    displayName: Promover Canário
+                    inputs:
+                      action: promote
+                      strategy: canary
+                      manifests: azure/deployment.yaml
+                      containers: $(ACR_LOGIN_SERVER)/$(MODULE_NAME):$(IMAGE_TAG)
